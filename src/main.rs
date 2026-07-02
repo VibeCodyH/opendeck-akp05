@@ -38,6 +38,14 @@ impl openaction::GlobalEventHandler for GlobalEventHandler {
             .await
             .insert("_watcher_task".to_string(), token);
 
+        let bg_token = CancellationToken::new();
+        tracker.spawn(background::watch_task(bg_token.clone()));
+
+        TOKENS
+            .write()
+            .await
+            .insert("_background_watch_task".to_string(), bg_token);
+
         log::info!("Plugin initialized");
 
         Ok(())

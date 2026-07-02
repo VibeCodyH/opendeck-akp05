@@ -244,32 +244,44 @@ fn map_position(mut position: u8, is_encoder: bool) -> Result<u8, MirajazzError>
     Ok(position)
 }
 
-/// Repaints the whole key grid in sync with the background frame clock:
-/// every tick, each key gets its video tile with the cached icon (if any)
-/// luminance-keyed on top. Pends forever when no background is configured.
+/// Repaints the key grid (and touchscreen strip, when the background covers
+/// it) in sync with the background frame clock: every tick, each surface gets
+/// its video tile with the cached icon (if any) luminance-keyed on top.
+/// Idles when no background is configured; picks up hot-reloads.
 async fn background_task(candidate: &CandidateDevice) -> Result<(), MirajazzError> {
-    let Some(bg) = background::BACKGROUND.as_ref() else {
-        std::future::pending::<()>().await;
-        unreachable!();
-    };
-
-    let format = candidate.kind.image_format();
-    let mut interval = interval(Duration::from_millis(bg.interval_ms.max(50)));
+    let key_format = candidate.kind.image_format();
+    let strip_format = candidate.kind.touch_image_format();
     let mut frame = 0usize;
 
     loop {
-        interval.tick().await;
+        let Some(bg) = background::current().await else {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            continue;
+        };
+        tokio::time::sleep(Duration::from_millis(bg.interval_ms.max(50))).await;
+        if frame >= bg.frame_count() {
+            frame = 0; // background was swapped for a shorter one
+        }
 
         // Compose everything first so the icon cache isn't locked during USB IO
-        let composed: Vec<(u8, image::RgbImage)> = {
+        let composed: Vec<(u8, bool, image::RgbImage)> = {
             let icons = background::ICONS.read().await;
             let device_icons = icons.get(&candidate.id);
-            (0..(ROW_COUNT * COL_COUNT) as u8)
-                .filter_map(|pos| {
-                    let icon = device_icons.and_then(|m| m.get(&pos));
-                    bg.compose(frame, pos, icon).map(|img| (pos, img))
-                })
-                .collect()
+            let mut v = Vec::new();
+            for pos in 0..(ROW_COUNT * COL_COUNT) as u8 {
+                let icon = device_icons.and_then(|m| m.get(&pos));
+                if let Some(img) = bg.compose(frame, pos, icon) {
+                    v.push((pos, false, img));
+                }
+            }
+            for s in 0..ENCODER_COUNT as u8 {
+                let slot = background::STRIP_SLOT + s;
+                let icon = device_icons.and_then(|m| m.get(&slot));
+                if let Some(img) = bg.compose(frame, slot, icon) {
+                    v.push((s, true, img));
+                }
+            }
+            v
         };
 
         let devices_lock = DEVICES.read().await;
@@ -278,10 +290,11 @@ async fn background_task(candidate: &CandidateDevice) -> Result<(), MirajazzErro
         };
 
         let result: Result<(), MirajazzError> = async {
-            for (pos, img) in composed {
+            for (pos, is_encoder, img) in composed {
+                let format = if is_encoder { &strip_format } else { &key_format };
                 device
                     .set_button_image(
-                        map_position(pos, false)?,
+                        map_position(pos, is_encoder)?,
                         format.clone(),
                         DynamicImage::ImageRgb8(img),
                     )
@@ -309,35 +322,19 @@ async fn background_task(candidate: &CandidateDevice) -> Result<(), MirajazzErro
 pub async fn handle_set_image(device: &Device, evt: SetImageEvent) -> Result<(), MirajazzError> {
     let is_encoder = evt.controller.as_deref() == Some("Encoder");
 
-    // Background mode: key images only update the icon cache — the frame
-    // clock (background_task) owns all key writes. Encoders pass through.
-    if !is_encoder && background::active() {
-        match (evt.position, evt.image) {
-            (Some(position), Some(image)) => {
-                let url = DataUrl::process(image.as_str()).unwrap();
-                let (body, _fragment) = url.decode_to_vec().unwrap();
-                if url.mime_type().subtype != "jpeg" {
-                    log::error!("Incorrect mime type: {}", url.mime_type());
-                    return Ok(());
-                }
-                let icon = load_from_memory_with_format(body.as_slice(), image::ImageFormat::Jpeg)?;
-                background::cache_icon(evt.device, position, Some(icon.to_rgb8())).await;
-            }
-            (Some(position), None) => {
-                background::cache_icon(evt.device, position, None).await;
-            }
-            (None, None) => {
-                background::clear_device(&evt.device).await;
-            }
-            _ => {}
-        }
-        return Ok(());
-    }
+    // Background layer: the icon cache is kept current on every event (even
+    // while inactive, so a hot-loaded background composites immediately).
+    // When the background covers this surface, skip the direct write — the
+    // frame clock (background_task) owns those writes.
+    let covered = match background::current().await {
+        Some(bg) => !is_encoder || bg.has_strip(),
+        None => false,
+    };
+    let slot_base = if is_encoder { background::STRIP_SLOT } else { 0 };
 
     match (evt.position, evt.image) {
         (Some(position), Some(image)) => {
             log::debug!("Setting image for button {}", position);
-            let position = map_position(position, is_encoder)?;
 
             // OpenDeck sends image as a data url, so parse it using a library
             let url = DataUrl::process(image.as_str()).unwrap(); // Isn't expected to fail, so unwrap it is
@@ -352,9 +349,14 @@ pub async fn handle_set_image(device: &Device, evt: SetImageEvent) -> Result<(),
 
             let image = load_from_memory_with_format(body.as_slice(), image::ImageFormat::Jpeg)?;
 
+            background::cache_icon(evt.device, slot_base + position, Some(image.to_rgb8())).await;
+            if covered {
+                return Ok(());
+            }
+
             device
                 .set_button_image(
-                    position,
+                    map_position(position, is_encoder)?,
                     if is_encoder {
                         Kind::from_vid_pid(device.vid, device.pid)
                             .unwrap()
@@ -370,11 +372,19 @@ pub async fn handle_set_image(device: &Device, evt: SetImageEvent) -> Result<(),
             device.flush().await?;
         }
         (Some(position), None) => {
+            background::cache_icon(evt.device, slot_base + position, None).await;
+            if covered {
+                return Ok(());
+            }
             let position = map_position(position, is_encoder)?;
             device.clear_button_image(position).await?;
             device.flush().await?;
         }
         (None, None) => {
+            background::clear_device(&evt.device).await;
+            if covered {
+                return Ok(());
+            }
             device.clear_all_button_images().await?;
             device.flush().await?;
         }
