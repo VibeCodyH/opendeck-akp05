@@ -1,14 +1,14 @@
 use std::time::Duration;
 
 use data_url::DataUrl;
-use image::load_from_memory_with_format;
+use image::{DynamicImage, load_from_memory_with_format};
 use mirajazz::{device::Device, error::MirajazzError, state::DeviceStateUpdate};
 use openaction::{OUTBOUND_EVENT_MANAGER, SetImageEvent};
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    DEVICES, TOKENS, led_config,
+    DEVICES, TOKENS, background, led_config,
     mappings::{
         COL_COUNT, CandidateDevice, DEVICE_TYPE, ENCODER_COUNT, KEY_COUNT, Kind, ROW_COUNT,
     },
@@ -71,6 +71,7 @@ pub async fn device_task(candidate: CandidateDevice, token: CancellationToken) {
     tokio::select! {
         _ = device_events_task(&candidate) => {},
         _ = keepalive_task(&candidate) => {},
+        _ = background_task(&candidate) => {},
         _ = token.cancelled() => {}
     };
 
@@ -243,9 +244,96 @@ fn map_position(mut position: u8, is_encoder: bool) -> Result<u8, MirajazzError>
     Ok(position)
 }
 
+/// Repaints the whole key grid in sync with the background frame clock:
+/// every tick, each key gets its video tile with the cached icon (if any)
+/// luminance-keyed on top. Pends forever when no background is configured.
+async fn background_task(candidate: &CandidateDevice) -> Result<(), MirajazzError> {
+    let Some(bg) = background::BACKGROUND.as_ref() else {
+        std::future::pending::<()>().await;
+        unreachable!();
+    };
+
+    let format = candidate.kind.image_format();
+    let mut interval = interval(Duration::from_millis(bg.interval_ms.max(50)));
+    let mut frame = 0usize;
+
+    loop {
+        interval.tick().await;
+
+        // Compose everything first so the icon cache isn't locked during USB IO
+        let composed: Vec<(u8, image::RgbImage)> = {
+            let icons = background::ICONS.read().await;
+            let device_icons = icons.get(&candidate.id);
+            (0..(ROW_COUNT * COL_COUNT) as u8)
+                .filter_map(|pos| {
+                    let icon = device_icons.and_then(|m| m.get(&pos));
+                    bg.compose(frame, pos, icon).map(|img| (pos, img))
+                })
+                .collect()
+        };
+
+        let devices_lock = DEVICES.read().await;
+        let Some(device) = devices_lock.get(&candidate.id) else {
+            return Ok(());
+        };
+
+        let result: Result<(), MirajazzError> = async {
+            for (pos, img) in composed {
+                device
+                    .set_button_image(
+                        map_position(pos, false)?,
+                        format.clone(),
+                        DynamicImage::ImageRgb8(img),
+                    )
+                    .await?;
+            }
+            device.flush().await
+        }
+        .await;
+
+        drop(devices_lock);
+
+        if let Err(e) = result {
+            if !handle_error(&candidate.id, e).await {
+                break;
+            }
+        }
+
+        frame = (frame + 1) % bg.frame_count();
+    }
+
+    Ok(())
+}
+
 /// Handles different combinations of "set image" event, including clearing the specific buttons and whole device
 pub async fn handle_set_image(device: &Device, evt: SetImageEvent) -> Result<(), MirajazzError> {
     let is_encoder = evt.controller.as_deref() == Some("Encoder");
+
+    // Background mode: key images only update the icon cache — the frame
+    // clock (background_task) owns all key writes. Encoders pass through.
+    if !is_encoder && background::active() {
+        match (evt.position, evt.image) {
+            (Some(position), Some(image)) => {
+                let url = DataUrl::process(image.as_str()).unwrap();
+                let (body, _fragment) = url.decode_to_vec().unwrap();
+                if url.mime_type().subtype != "jpeg" {
+                    log::error!("Incorrect mime type: {}", url.mime_type());
+                    return Ok(());
+                }
+                let icon = load_from_memory_with_format(body.as_slice(), image::ImageFormat::Jpeg)?;
+                background::cache_icon(evt.device, position, Some(icon.to_rgb8())).await;
+            }
+            (Some(position), None) => {
+                background::cache_icon(evt.device, position, None).await;
+            }
+            (None, None) => {
+                background::clear_device(&evt.device).await;
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
     match (evt.position, evt.image) {
         (Some(position), Some(image)) => {
             log::debug!("Setting image for button {}", position);

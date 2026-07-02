@@ -9,6 +9,7 @@ use watcher::watcher_task;
 #[cfg(not(target_os = "windows"))]
 use tokio::signal::unix::{SignalKind, signal};
 
+mod background;
 mod device;
 mod inputs;
 mod led_config;
