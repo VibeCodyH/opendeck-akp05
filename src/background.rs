@@ -19,6 +19,7 @@ use image::{RgbImage, imageops};
 use openaction::OUTBOUND_EVENT_MANAGER;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
@@ -26,9 +27,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::mappings::{COL_COUNT, ROW_COUNT};
 
-const TILE: u32 = 112; // native key resolution (protocol v3)
-const STRIP_W: u32 = 176; // native strip tile resolution, per encoder
-const STRIP_H: u32 = 112;
 /// Cache slot offset for strip icons (mirrors map_position's encoder offset)
 pub const STRIP_SLOT: u8 = 10;
 
@@ -73,6 +71,14 @@ static BACKGROUND: LazyLock<RwLock<Option<Arc<Background>>>> = LazyLock::new(|| 
 pub static ICONS: LazyLock<RwLock<HashMap<String, HashMap<u8, RgbImage>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
+/// Bumped on every icon-cache change; lets the frame clock skip repaints when
+/// the background is a single still frame and nothing on top has changed.
+static ICON_GEN: AtomicU64 = AtomicU64::new(0);
+
+pub fn icon_generation() -> u64 {
+    ICON_GEN.load(Ordering::Relaxed)
+}
+
 pub async fn current() -> Option<Arc<Background>> {
     BACKGROUND.read().await.clone()
 }
@@ -97,14 +103,33 @@ pub async fn watch_task(token: CancellationToken) {
         if mtime != last {
             last = mtime;
             let bg = tokio::task::spawn_blocking(load).await.ok().flatten();
-            let loaded = bg.is_some();
+            let was = BACKGROUND.read().await.is_some();
+            let now = bg.is_some();
             *BACKGROUND.write().await = bg.map(Arc::new);
-            if loaded {
-                // Ask OpenDeck to resend every image so icon caches repopulate
+            if was && !now {
+                // Background removed: wipe the stale video off every surface
+                // BEFORE the rerender below restores the plain icons.
+                for (_, device) in crate::DEVICES.read().await.iter() {
+                    device.clear_all_button_images().await.ok();
+                    device.flush().await.ok();
+                }
+                log::info!("background: removed, restoring plain icons");
+            }
+            if was || now {
+                // Ask OpenDeck to resend every image (repopulates icon caches
+                // after a load; repaints plain icons after an unload)
                 if let Some(outbound) = OUTBOUND_EVENT_MANAGER.lock().await.as_mut() {
                     for id in crate::DEVICES.read().await.keys() {
                         outbound.rerender_images(id.clone()).await.ok();
                     }
+                }
+                // Hand the old background's freed frame memory back to the OS
+                // (glibc retains it otherwise). The frame clock holds the old
+                // Arc for up to one tick, so give it a moment to drop first.
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                #[cfg(target_os = "linux")]
+                unsafe {
+                    libc::malloc_trim(0);
                 }
             }
         }
@@ -125,6 +150,16 @@ fn load() -> Option<Background> {
         Err(_) => return None, // no background configured
     };
 
+    // Every frame is kept decoded in RAM (~0.5MB per frame of key+strip
+    // tiles), so refuse absurd renders instead of eating gigabytes.
+    if meta.count > 1000 {
+        log::error!(
+            "background: {} frames is too many (limit 1000) — re-render with a shorter --seconds or lower --fps; background disabled",
+            meta.count
+        );
+        return None;
+    }
+
     let rows = meta.rows.min(ROW_COUNT);
     let cols = meta.cols.min(COL_COUNT);
     let strip = meta.strip.min(4);
@@ -134,15 +169,12 @@ fn load() -> Option<Background> {
         for r in 0..rows {
             for c in 0..cols {
                 let path = dir.join(format!("f{:05}_r{}_c{}.jpg", i, r, c));
-                tiles.insert(
-                    (r * COL_COUNT + c) as u8,
-                    load_tile(&path, TILE, TILE)?,
-                );
+                tiles.insert((r * COL_COUNT + c) as u8, load_tile(&path)?);
             }
         }
         for s in 0..strip {
             let path = dir.join(format!("f{:05}_s{}.jpg", i, s));
-            tiles.insert(STRIP_SLOT + s as u8, load_tile(&path, STRIP_W, STRIP_H)?);
+            tiles.insert(STRIP_SLOT + s as u8, load_tile(&path)?);
         }
         frames.push(tiles);
     }
@@ -170,19 +202,16 @@ fn load() -> Option<Background> {
     })
 }
 
-fn load_tile(path: &std::path::Path, w: u32, h: u32) -> Option<RgbImage> {
-    let img = match image::open(path) {
-        Ok(img) => img,
+fn load_tile(path: &std::path::Path) -> Option<RgbImage> {
+    // Tiles are kept at whatever size the renderer produced; icons are resized
+    // to match at compose time, and mirajazz fits the composite to the device.
+    match image::open(path) {
+        Ok(img) => Some(img.to_rgb8()),
         Err(e) => {
             log::warn!("background: failed to load {path:?}, background disabled: {e}");
-            return None;
+            None
         }
-    };
-    let mut rgb = img.to_rgb8();
-    if rgb.width() != w || rgb.height() != h {
-        rgb = imageops::resize(&rgb, w, h, imageops::FilterType::Triangle);
     }
-    Some(rgb)
 }
 
 impl Background {
@@ -206,6 +235,15 @@ impl Background {
             return Some(icon.clone());
         }
 
+        // Icons arrive at OpenDeck's render size; match the tile before blending
+        let resized;
+        let icon = if icon.dimensions() != tile.dimensions() {
+            resized = imageops::resize(icon, tile.width(), tile.height(), imageops::FilterType::Triangle);
+            &resized
+        } else {
+            icon
+        };
+
         let (lo, hi) = (self.key_lo as u16, self.key_hi as u16);
         let mut out = tile.clone();
         for (o, i) in out.pixels_mut().zip(icon.pixels()) {
@@ -225,21 +263,13 @@ impl Background {
     }
 }
 
-/// Store the image OpenDeck sent for a key/strip slot, sized to the slot's
-/// native resolution. Cached even when the background is inactive, so a
+/// Store the image OpenDeck sent for a key/strip slot, as received (compose
+/// resizes to the tile). Cached even when the background is inactive, so a
 /// hot-loaded background composites immediately.
 pub async fn cache_icon(device: String, slot: u8, icon: Option<RgbImage>) {
     let mut icons = ICONS.write().await;
     match icon {
-        Some(mut rgb) => {
-            let (w, h) = if slot >= STRIP_SLOT {
-                (STRIP_W, STRIP_H)
-            } else {
-                (TILE, TILE)
-            };
-            if rgb.width() != w || rgb.height() != h {
-                rgb = imageops::resize(&rgb, w, h, imageops::FilterType::Triangle);
-            }
+        Some(rgb) => {
             icons.entry(device).or_default().insert(slot, rgb);
         }
         None => {
@@ -248,8 +278,10 @@ pub async fn cache_icon(device: String, slot: u8, icon: Option<RgbImage>) {
             }
         }
     }
+    ICON_GEN.fetch_add(1, Ordering::Relaxed);
 }
 
 pub async fn clear_device(device: &str) {
     ICONS.write().await.remove(device);
+    ICON_GEN.fetch_add(1, Ordering::Relaxed);
 }

@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+# deck-bg — control the video/image background layer of the opendeck-akp05
+# driver fork.
+#
+#   deck-bg set <file> [render options]   use a video, GIF, or still image
+#   deck-bg follow                        follow the KDE live wallpaper (Plasma)
+#   deck-bg off                           background off, plain icons restored
+#   deck-bg status                        what's active
+#   deck-bg daemon                        (internal) wallpaper-follow loop,
+#                                         run by deck-bg-sync.service
+#
+# The driver hot-reloads ~/.config/opendeck-akp05/background/ whenever its
+# meta.json changes — no OpenDeck restart needed. Renders are cached per
+# source+options in ~/.cache/deck-bg/renders/. meta.json is always deployed
+# LAST so the driver never loads a half-written background.
+# Requires: python3 + Pillow; ffmpeg for video/GIF sources.
+import hashlib, json, shutil, subprocess, sys, time
+from pathlib import Path
+
+CONFIG = Path.home() / '.config/opendeck-akp05/deck-bg.json'
+LIVE = Path.home() / '.config/opendeck-akp05/background'
+CACHE = Path.home() / '.cache/deck-bg'
+VIDEO_EXT = {'.mp4', '.webm', '.mov', '.mkv', '.avi', '.gif'}
+STILL_EXT = {'.png', '.jpg', '.jpeg', '.bmp', '.webp'}
+POLL_S = 15
+
+
+def read_config():
+    try:
+        return json.loads(CONFIG.read_text())
+    except (OSError, ValueError):
+        return {'mode': 'off'}
+
+
+def write_config(cfg):
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG.write_text(json.dumps(cfg, indent=2))
+
+
+def deploy(source, render_args):
+    """Render (cached) and copy into the live dir, meta.json last."""
+    if '--seconds' not in render_args:
+        # Cap the loop length: the driver keeps every frame decoded in RAM
+        # (a full-length video means hundreds of MB), and long loops read as
+        # wallpaper anyway. Pass your own --seconds to override.
+        render_args = render_args + ['--seconds', '20']
+    key = hashlib.sha1(json.dumps([str(source)] + render_args).encode()).hexdigest()[:12]
+    render = CACHE / 'renders' / key
+    fresh = not (render / 'meta.json').exists()
+    if fresh:
+        subprocess.run(
+            [sys.executable, str(Path(__file__).resolve().parent / 'render_frames.py'),
+             str(source), '--out', str(render)] + render_args,
+            check=True)
+    LIVE.mkdir(parents=True, exist_ok=True)
+    tiles = sorted(render.glob('f*.jpg'))
+    for f in tiles:
+        shutil.copy2(f, LIVE / f.name)
+    shutil.copy2(render / 'meta.json', LIVE / 'meta.json')
+    keep = {f.name for f in tiles}
+    for f in LIVE.glob('f*.jpg'):
+        if f.name not in keep:
+            f.unlink()
+    print(f'deck-bg: {Path(source).name} ({"rendered" if fresh else "from cache"})',
+          flush=True)
+
+
+def open_wallpaper_videos():
+    """Video files plasmashell currently has open (the live truth — Plasma's
+    config LastVideo= goes stale, so /proc is the reliable source)."""
+    videos = set()
+    try:
+        pid = subprocess.run(['pidof', 'plasmashell'], capture_output=True,
+                             text=True).stdout.split()[0]
+        for fd in (Path('/proc') / pid / 'fd').iterdir():
+            try:
+                target = fd.resolve()
+            except OSError:
+                continue
+            if target.suffix.lower() in VIDEO_EXT and target.exists():
+                videos.add(target)
+    except (IndexError, OSError):
+        pass
+    return videos
+
+
+def deployed_source():
+    """Basename of what's live on the deck right now (ground truth)."""
+    try:
+        return json.loads((LIVE / 'meta.json').read_text()).get('source')
+    except (OSError, ValueError):
+        return None
+
+
+def daemon():
+    prev_open = set()
+    pending = None
+    while True:
+        cfg = read_config()
+        if cfg.get('mode') != 'wallpaper':
+            prev_open = set()
+            pending = None
+            time.sleep(POLL_S)
+            continue
+        now = open_wallpaper_videos()
+        new = now - prev_open
+        prev_open = now
+        shown = deployed_source()
+        if new:
+            target = sorted(new)[0]  # what the user just switched to
+        else:
+            target = next((v for v in sorted(now) if v.name == shown), None) \
+                or (sorted(now)[0] if now else None)
+        if target and target.name != shown:
+            if target == pending:    # stable for two polls -> commit
+                deploy(target, cfg.get('render_args', []))
+                pending = None
+            else:
+                pending = target
+        else:
+            pending = None
+        time.sleep(POLL_S)
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else 'status'
+    if cmd == 'set':
+        if len(sys.argv) < 3:
+            sys.exit('usage: deck-bg set <video|gif|image> [render options]')
+        source = Path(sys.argv[2]).expanduser().resolve()
+        if not source.exists():
+            sys.exit(f'deck-bg: no such file: {source}')
+        if source.suffix.lower() not in VIDEO_EXT | STILL_EXT:
+            sys.exit(f'deck-bg: unsupported file type: {source.suffix}')
+        render_args = sys.argv[3:]
+        write_config({'mode': 'video', 'source': str(source), 'render_args': render_args})
+        deploy(source, render_args)
+    elif cmd == 'follow':
+        cfg = read_config()
+        cfg['mode'] = 'wallpaper'
+        write_config(cfg)
+        print('deck-bg: following the desktop live wallpaper')
+        r = subprocess.run(['systemctl', '--user', 'is-active', '--quiet',
+                            'deck-bg-sync.service'])
+        if r.returncode != 0:
+            print('note: the follow daemon is not running — enable it with:\n'
+                  '  systemctl --user enable --now deck-bg-sync.service')
+    elif cmd == 'off':
+        cfg = read_config()
+        cfg['mode'] = 'off'
+        write_config(cfg)
+        (LIVE / 'meta.json').unlink(missing_ok=True)
+        print('deck-bg: background off (icons restore within a few seconds)')
+    elif cmd == 'status':
+        cfg = read_config()
+        print(f"mode: {cfg.get('mode', 'off')}")
+        if cfg.get('mode') == 'video':
+            print(f"source: {cfg.get('source')}")
+        if cfg.get('mode') == 'wallpaper':
+            r = subprocess.run(['systemctl', '--user', 'is-active', '--quiet',
+                                'deck-bg-sync.service'])
+            print(f"follow daemon: {'running' if r.returncode == 0 else 'NOT running'}")
+        try:
+            meta = json.loads((LIVE / 'meta.json').read_text())
+            print(f"deployed: {meta.get('source')} "
+                  f"({meta.get('count')} frames @ {meta.get('fps')} fps)")
+        except (OSError, ValueError):
+            print('deployed: nothing')
+    elif cmd == 'daemon':
+        daemon()
+    else:
+        sys.exit('usage: deck-bg set <video|gif|image> [render options] '
+                 '| follow | off | status')
+
+
+if __name__ == '__main__':
+    main()

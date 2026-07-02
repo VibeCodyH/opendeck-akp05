@@ -647,6 +647,7 @@ dependencies = [
  "env_logger",
  "futures-lite",
  "image",
+ "libc",
  "log",
  "mirajazz",
  "openaction",

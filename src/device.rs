@@ -252,6 +252,10 @@ async fn background_task(candidate: &CandidateDevice) -> Result<(), MirajazzErro
     let key_format = candidate.kind.image_format();
     let strip_format = candidate.kind.touch_image_format();
     let mut frame = 0usize;
+    // (frame, icon generation, background identity) of the last paint — when a
+    // still background (frame_count 1) and the icons are both unchanged,
+    // skip the tick entirely instead of spamming identical images over USB.
+    let mut painted: Option<(usize, u64, usize)> = None;
 
     loop {
         let Some(bg) = background::current().await else {
@@ -261,6 +265,10 @@ async fn background_task(candidate: &CandidateDevice) -> Result<(), MirajazzErro
         tokio::time::sleep(Duration::from_millis(bg.interval_ms.max(50))).await;
         if frame >= bg.frame_count() {
             frame = 0; // background was swapped for a shorter one
+        }
+        let state = (frame, background::icon_generation(), std::sync::Arc::as_ptr(&bg) as usize);
+        if painted == Some(state) {
+            continue;
         }
 
         // Compose everything first so the icon cache isn't locked during USB IO
@@ -310,6 +318,8 @@ async fn background_task(candidate: &CandidateDevice) -> Result<(), MirajazzErro
             if !handle_error(&candidate.id, e).await {
                 break;
             }
+        } else {
+            painted = Some(state);
         }
 
         frame = (frame + 1) % bg.frame_count();

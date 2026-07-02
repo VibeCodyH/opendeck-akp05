@@ -1,6 +1,88 @@
 ![Plugin Icon](assets/icon.png)
 
-# OpenDeck Ajazz AKP05 / Mirabox N4 Plugin
+# OpenDeck Ajazz AKP05 / Mirabox N4 Plugin — video background fork
+
+A fork of [ambiso/opendeck-akp05](https://github.com/ambiso/opendeck-akp05) that adds
+**full-deck video, GIF, and image backgrounds** — the feature the Windows vendor
+software (VSD Craft / Mirabox) has and nothing on Linux did.
+
+## The background layer
+
+- One looping video (or GIF, or still image) plays across **all 10 LCD keys and the
+  touchscreen strip** as a single continuous picture, bezel gaps accounted for.
+- Your key icons stay **on top** of the video and your buttons keep working exactly
+  as before — icons are composited over the background with luminance keying
+  (near-black pixels become transparent, so icons rendered on black float over the
+  video the way the vendor software does it).
+- Backgrounds **hot-reload**: change the video and the deck follows in ~2 seconds,
+  no OpenDeck restart.
+- On KDE Plasma, the deck can **follow your live video wallpaper** automatically.
+- No background configured → the driver behaves exactly like stock.
+
+### Setup
+
+1. Install this fork's build of the plugin (see Installation below — either install
+   the release from this repo, or replace the `opendeck-akp05-linux` binary inside an
+   existing install of the upstream plugin and restart OpenDeck).
+2. Get the `tools/` directory from this repo. You'll need `python3` with
+   [Pillow](https://pypi.org/project/pillow/) (`pip install pillow`), and `ffmpeg` on
+   PATH for video/GIF sources.
+
+### Usage
+
+```sh
+deck-bg set ~/Videos/some-loop.mp4     # use a video (or .gif / .png / .jpg / .webp)
+deck-bg off                            # background off, plain icons restored
+deck-bg status                         # what's currently deployed
+```
+
+Follow your KDE Plasma live video wallpaper (e.g. the
+[Smart Video Wallpaper reborn](https://github.com/luisbocanegra/plasma-smart-video-wallpaper-reborn)
+plugin) — whenever your desktop wallpaper changes, the deck follows within ~30s:
+
+```sh
+# one-time: install the follow daemon (adjust the repo path inside the unit first)
+cp tools/deck-bg-sync.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now deck-bg-sync.service
+
+deck-bg follow
+```
+
+### Tuning
+
+`deck-bg set` passes extra options through to the renderer:
+
+```sh
+deck-bg set video.mp4 --fps 3            # fewer frames/sec (if the deck stutters)
+deck-bg set video.mp4 --gap 0.35         # bezel gap between keys, fraction of key size
+                                         #   (raise/lower until the picture lines up)
+deck-bg set video.mp4 --opaque 4,9       # slots drawn as-is, no keying
+                                         #   (0-4 top key row, 5-9 bottom, 10-13 strip)
+deck-bg set video.mp4 --key-lo 24 --key-hi 64   # keying thresholds (0-255 luminance):
+                                         #   below lo = video, above hi = icon
+deck-bg set video.mp4 --no-strip         # keys only, leave the touchscreen strip alone
+deck-bg set video.mp4 --seconds 10       # only use the first N seconds
+```
+
+Renders are cached in `~/.cache/deck-bg/renders/` (a few MB per video), so switching
+back to a background you've used before is instant.
+
+### How it works
+
+The renderer slices each frame of the source into per-key JPEG tiles laid out on a
+virtual canvas of the deck's face (keys + bezel gaps + strip band) and writes them to
+`~/.config/opendeck-akp05/background/`. The driver watches that directory's
+`meta.json`; when it changes, the frames hot-reload. From then on the driver caches
+every key image OpenDeck sends instead of writing it straight to the device, and a
+frame clock composites icon-over-tile for the whole deck in sync each tick. Still
+images paint once and go quiet instead of re-sending identical frames over USB.
+
+The background layer is developed and tested on Linux; the rest of the driver is
+unchanged from upstream.
+
+---
+
+# Upstream documentation
 
 An unofficial plugin for Mirabox N4-family devices
 
@@ -30,7 +112,7 @@ Requires OpenDeck 2.5.0 or newer
 
 ## Installation
 
-1. Download an archive from [releases](https://github.com/ambiso/opendeck-akp05/releases)
+1. Download an archive from [releases](../../releases)
 2. In OpenDeck: Plugins -> Install from file
 3. Download [udev rules](./40-opendeck-akp05.rules) and install them by copying into `/etc/udev/rules.d/` and running `sudo udevadm control --reload-rules`
 4. Unplug and plug again the device, restart OpenDeck
@@ -111,6 +193,9 @@ $ just package
 ```
 
 ## Acknowledgments
+
+The video background layer was added in this fork; everything else is the work of
+[ambiso](https://github.com/ambiso/opendeck-akp05) and the upstream contributors.
 
 This plugin is heavily based on work by contributors of [elgato-streamdeck](https://github.com/streamduck-org/elgato-streamdeck) crate
 
