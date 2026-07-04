@@ -128,7 +128,9 @@ pub async fn watch_task(token: CancellationToken) {
                 if let Some(marker) = face_marker_path() {
                     if marker.exists() {
                         let black = crate::device::black_face_jpeg();
-                        for (_, device) in crate::DEVICES.read().await.iter() {
+                        for (id, device) in crate::DEVICES.read().await.iter() {
+                            let wire = crate::device::wire_lock(id);
+                            let _wire = wire.lock().await;
                             crate::device::write_face(device, &black).await.ok();
                         }
                         tokio::time::sleep(Duration::from_millis(2500)).await;
@@ -137,7 +139,9 @@ pub async fn watch_task(token: CancellationToken) {
                 }
                 // Background removed: wipe the stale video off every surface
                 // BEFORE the rerender below restores the plain icons.
-                for (_, device) in crate::DEVICES.read().await.iter() {
+                for (id, device) in crate::DEVICES.read().await.iter() {
+                    let wire = crate::device::wire_lock(id);
+                    let _wire = wire.lock().await;
                     device.clear_all_button_images().await.ok();
                     device.flush().await.ok();
                 }

@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use data_url::DataUrl;
@@ -203,6 +205,7 @@ async fn device_events_task(candidate: &CandidateDevice) -> Result<(), MirajazzE
 /// Sends periodic keepalives to the device to maintain connection
 async fn keepalive_task(candidate: &CandidateDevice) -> Result<(), MirajazzError> {
     let mut interval = interval(Duration::from_secs(10));
+    let wire = wire_lock(&candidate.id);
 
     loop {
         interval.tick().await;
@@ -215,7 +218,10 @@ async fn keepalive_task(candidate: &CandidateDevice) -> Result<(), MirajazzError
             None => return Ok(()),
         };
 
-        if let Err(e) = device.keep_alive().await {
+        let wire_guard = wire.lock().await;
+        let result = device.keep_alive().await;
+        drop(wire_guard);
+        if let Err(e) = result {
             drop(devices_lock);
             if !handle_error(&candidate.id, e).await {
                 break;
@@ -224,6 +230,24 @@ async fn keepalive_task(candidate: &CandidateDevice) -> Result<(), MirajazzError
     }
 
     Ok(())
+}
+
+/// Serializes all writes to one device's HID endpoint. mirajazz's writer
+/// mutex is per-packet, so without this a keepalive (or any command) can land
+/// between the chunks of an in-flight image transfer during flush — the
+/// device mangles that key's render for one frame (visible as periodic icon
+/// glitches on animated backgrounds). Lock order: DEVICES read lock first,
+/// wire lock second, everywhere.
+static WIRE_LOCKS: LazyLock<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+pub fn wire_lock(id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    WIRE_LOCKS
+        .lock()
+        .unwrap()
+        .entry(id.to_string())
+        .or_default()
+        .clone()
 }
 
 /// Inputs read before this deadline (ms since UNIX_EPOCH) are dropped. The
@@ -336,6 +360,7 @@ fn map_position(mut position: u8, is_encoder: bool) -> Result<u8, MirajazzError>
 async fn background_task(candidate: &CandidateDevice) -> Result<(), MirajazzError> {
     let key_format = candidate.kind.image_format();
     let strip_format = candidate.kind.touch_image_format();
+    let wire = wire_lock(&candidate.id);
     let mut frame = 0usize;
     // (frame, icon generation, background identity) of the last paint — when a
     // still background (frame_count 1) and the icons are both unchanged,
@@ -376,6 +401,7 @@ async fn background_task(candidate: &CandidateDevice) -> Result<(), MirajazzErro
                         let Some(device) = devices_lock.get(&candidate.id) else {
                             return Ok(());
                         };
+                        let _wire = wire.lock().await;
                         if let Err(e) = write_face(device, jpeg).await {
                             log::warn!("background: face flash failed: {e}");
                         }
@@ -422,7 +448,13 @@ async fn background_task(candidate: &CandidateDevice) -> Result<(), MirajazzErro
             return Ok(());
         };
 
+        let wire_guard = wire.lock().await;
         let result: Result<(), MirajazzError> = async {
+            // Write + commit each surface individually with a short gap, the
+            // same shape as stock single-key writes. Blasting all 14 surfaces
+            // back-to-back under one commit overruns the device's decode
+            // pipeline and it mis-renders a key for a tick (rate-proportional
+            // icon glitches on animated backgrounds).
             for (pos, is_encoder, img) in composed {
                 let format = if is_encoder { &strip_format } else { &key_format };
                 device
@@ -432,11 +464,14 @@ async fn background_task(candidate: &CandidateDevice) -> Result<(), MirajazzErro
                         DynamicImage::ImageRgb8(img),
                     )
                     .await?;
+                device.flush().await?;
+                tokio::time::sleep(Duration::from_millis(2)).await;
             }
-            device.flush().await
+            Ok(())
         }
         .await;
 
+        drop(wire_guard);
         drop(devices_lock);
 
         if let Err(e) = result {
@@ -456,6 +491,7 @@ async fn background_task(candidate: &CandidateDevice) -> Result<(), MirajazzErro
 /// Handles different combinations of "set image" event, including clearing the specific buttons and whole device
 pub async fn handle_set_image(device: &Device, evt: SetImageEvent) -> Result<(), MirajazzError> {
     let is_encoder = evt.controller.as_deref() == Some("Encoder");
+    let wire = wire_lock(&evt.device);
 
     // Background layer: the icon cache is kept current on every event (even
     // while inactive, so a hot-loaded background composites immediately).
@@ -489,6 +525,7 @@ pub async fn handle_set_image(device: &Device, evt: SetImageEvent) -> Result<(),
                 return Ok(());
             }
 
+            let _wire = wire.lock().await;
             device
                 .set_button_image(
                     map_position(position, is_encoder)?,
@@ -511,6 +548,7 @@ pub async fn handle_set_image(device: &Device, evt: SetImageEvent) -> Result<(),
             if covered {
                 return Ok(());
             }
+            let _wire = wire.lock().await;
             let position = map_position(position, is_encoder)?;
             device.clear_button_image(position).await?;
             device.flush().await?;
@@ -520,6 +558,7 @@ pub async fn handle_set_image(device: &Device, evt: SetImageEvent) -> Result<(),
             if covered {
                 return Ok(());
             }
+            let _wire = wire.lock().await;
             device.clear_all_button_images().await?;
             device.flush().await?;
         }
