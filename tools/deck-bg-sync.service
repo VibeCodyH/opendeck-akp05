@@ -1,5 +1,9 @@
 [Unit]
 Description=Sync stream deck video background to the KDE live wallpaper
+# Start only once the Plasma/Wayland session env (WAYLAND_DISPLAY etc.) is imported,
+# otherwise the daemon freezes a display-less env and every kscreen-doctor child aborts.
+After=graphical-session.target
+PartOf=graphical-session.target
 
 [Service]
 # Adjust the path to wherever you cloned this repo
@@ -8,4 +12,4 @@ Restart=always
 RestartSec=10
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target
