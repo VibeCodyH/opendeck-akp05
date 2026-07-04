@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use data_url::DataUrl;
@@ -162,6 +163,14 @@ async fn device_events_task(candidate: &CandidateDevice) -> Result<(), MirajazzE
             }
         };
 
+        if inputs_suppressed() && !updates.is_empty() {
+            log::info!(
+                "Dropping {} input event(s) read during the face-flash window",
+                updates.len()
+            );
+            continue;
+        }
+
         for update in updates {
             log::debug!("New update: {:#?}", update);
 
@@ -217,6 +226,27 @@ async fn keepalive_task(candidate: &CandidateDevice) -> Result<(), MirajazzError
     Ok(())
 }
 
+/// Inputs read before this deadline (ms since UNIX_EPOCH) are dropped. The
+/// face flash makes the device emit ACK/status reports that parse as phantom
+/// presses (observed: encoder 0 taps — "mute" — on every background switch),
+/// so the reader ignores everything from flash start until shortly after.
+static INPUT_SUPPRESS_UNTIL: AtomicU64 = AtomicU64::new(0);
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn suppress_inputs_for_ms(ms: u64) {
+    INPUT_SUPPRESS_UNTIL.store(now_ms() + ms, Ordering::Relaxed);
+}
+
+fn inputs_suppressed() -> bool {
+    now_ms() < INPUT_SUPPRESS_UNTIL.load(Ordering::Relaxed)
+}
+
 /// Flash the full-face 800x480 background (the persistent "LOG" write, the
 /// same one the vendor tool uses for its device background). It lights the
 /// entire touchscreen strip as one seamless band — including the ~32px gaps
@@ -228,6 +258,15 @@ async fn keepalive_task(candidate: &CandidateDevice) -> Result<(), MirajazzError
 /// callers must sleep ~2s afterwards before sending images. Never call this
 /// per frame — flash wear. Only on background *change*.
 pub async fn write_face(device: &Device, jpeg: &[u8]) -> Result<(), MirajazzError> {
+    // Cover the whole flash, then trim to a short tail once it's done — the
+    // device keeps emitting phantom-parsing reports for a moment after STP.
+    suppress_inputs_for_ms(30_000);
+    let result = write_face_inner(device, jpeg).await;
+    suppress_inputs_for_ms(3_000);
+    result
+}
+
+async fn write_face_inner(device: &Device, jpeg: &[u8]) -> Result<(), MirajazzError> {
     let n = jpeg.len();
     let mut hdr = vec![
         0x00, 0x43, 0x52, 0x54, 0x00, 0x00, // report id + "CRT" prefix
