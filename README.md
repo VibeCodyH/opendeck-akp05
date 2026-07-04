@@ -10,13 +10,19 @@ software (VSD Craft / Mirabox) has and nothing on Linux did.
 
 - One looping video (or GIF, or still image) plays across **all 10 LCD keys and the
   touchscreen strip** as a single continuous picture, bezel gaps accounted for.
+- The touchscreen strip renders as **one seamless bar**, like the vendor software:
+  the driver flashes the wallpaper as the device's persistent background (the same
+  mechanism VSD Craft uses), which lights the strip edge-to-edge — including the
+  slivers between its four touch zones that per-key writes can't reach. Bonus: the
+  device shows your wallpaper at power-on, before the host even connects.
 - Your key icons stay **on top** of the video and your buttons keep working exactly
   as before — icons are composited over the background with luminance keying
   (near-black pixels become transparent, so icons rendered on black float over the
   video the way the vendor software does it).
 - Backgrounds **hot-reload**: change the video and the deck follows in ~2 seconds,
   no OpenDeck restart.
-- On KDE Plasma, the deck can **follow your live video wallpaper** automatically.
+- On KDE Plasma, the deck can **follow your live video wallpaper** automatically —
+  and on multi-monitor setups, **pin which monitor** it follows.
 - No background configured → the driver behaves exactly like stock.
 
 ### Setup
@@ -34,6 +40,8 @@ software (VSD Craft / Mirabox) has and nothing on Linux did.
 deck-bg set ~/Videos/some-loop.mp4     # use a video (or .gif / .png / .jpg / .webp)
 deck-bg off                            # background off, plain icons restored
 deck-bg status                         # what's currently deployed
+deck-bg test                           # labelled diagnostic pattern (tile order,
+                                       #   orientation, strip alignment)
 ```
 
 Follow your KDE Plasma live video wallpaper (e.g. the
@@ -45,21 +53,30 @@ plugin) — whenever your desktop wallpaper changes, the deck follows within ~30
 cp tools/deck-bg-sync.service ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now deck-bg-sync.service
 
-deck-bg follow
+deck-bg follow                         # follow the primary monitor's wallpaper
+deck-bg follow --monitor DP-3          # …or pin one monitor by connector name
+deck-bg follow --monitor 1             # …or by Plasma screen index
 ```
+
+With multiple monitors each screen can run a different wallpaper; `--monitor` pins
+which one the deck mirrors (default: primary). Re-running `deck-bg follow` without
+`--monitor` resets the pin to the primary monitor.
 
 ### Tuning
 
 `deck-bg set` passes extra options through to the renderer:
 
 ```sh
-deck-bg set video.mp4 --fps 3            # fewer frames/sec (if the deck stutters)
+deck-bg set video.mp4 --fps 5            # fewer frames/sec (default 10; lower it
+                                         #   if the deck stutters)
 deck-bg set video.mp4 --gap 0.35         # bezel gap between keys, fraction of key size
                                          #   (raise/lower until the picture lines up)
 deck-bg set video.mp4 --opaque 4,9       # slots drawn as-is, no keying
                                          #   (0-4 top key row, 5-9 bottom, 10-13 strip)
-deck-bg set video.mp4 --key-lo 24 --key-hi 64   # keying thresholds (0-255 luminance):
-                                         #   below lo = video, above hi = icon
+deck-bg set video.mp4 --key-lo 40 --key-hi 80   # keying thresholds (0-255 luminance):
+                                         #   below lo = video, above hi = icon. Raise
+                                         #   them if icons leave faint boxes on the
+                                         #   strip; lower if dark icon detail vanishes
 deck-bg set video.mp4 --no-strip         # keys only, leave the touchscreen strip alone
 deck-bg set video.mp4 --seconds 10       # only use the first N seconds
 ```
@@ -76,6 +93,20 @@ virtual canvas of the deck's face (keys + bezel gaps + strip band) and writes th
 every key image OpenDeck sends instead of writing it straight to the device, and a
 frame clock composites icon-over-tile for the whole deck in sync each tick. Still
 images paint once and go quiet instead of re-sending identical frames over USB.
+
+The touchscreen strip is one continuous LCD, but the firmware only exposes four
+176x112 windows of it (at x = 0/208/416/624 of an 800x480 face; rows 368-480) to
+per-key writes — the ~32px slivers between windows are unreachable that way, which
+is why naive strip tiling shows "four boxes". The fix, reverse-engineered from the
+vendor SDK's `libtransport.so`: the renderer also emits the full 800x480 face
+(`f_face.jpg`, frame 0, pre-rotated 180°), and the driver flashes it to the device
+as the persistent background (`CRT LOG` write). The flashed face lights the slivers;
+the four windows animate over it with zone tiles cropped in register. The flash
+happens **only when the background changes** (a content-hash marker suppresses
+repeats — it's a real flash write and takes ~2s, during which the firmware drops
+incoming commands), and `deck-bg off` flashes black to clear it. Side effects: your
+wallpaper doubles as the power-on image, replacing the stock VSD boot screen, and
+per-frame strip animation pauses in the slivers (they hold frame 0).
 
 The background layer is developed and tested on Linux; the rest of the driver is
 unchanged from upstream.

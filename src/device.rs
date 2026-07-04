@@ -217,6 +217,52 @@ async fn keepalive_task(candidate: &CandidateDevice) -> Result<(), MirajazzError
     Ok(())
 }
 
+/// Flash the full-face 800x480 background (the persistent "LOG" write, the
+/// same one the vendor tool uses for its device background). It lights the
+/// entire touchscreen strip as one seamless band — including the ~32px gaps
+/// between the four per-key zone windows that `set_button_image` can never
+/// reach — and survives power cycles (it doubles as the boot image).
+///
+/// This is a firmware FLASH write: it blocks the device for a couple of
+/// seconds and commands sent meanwhile are dropped (verified on-device), so
+/// callers must sleep ~2s afterwards before sending images. Never call this
+/// per frame — flash wear. Only on background *change*.
+pub async fn write_face(device: &Device, jpeg: &[u8]) -> Result<(), MirajazzError> {
+    let n = jpeg.len();
+    let mut hdr = vec![
+        0x00, 0x43, 0x52, 0x54, 0x00, 0x00, // report id + "CRT" prefix
+        0x4C, 0x4F, 0x47, // "LOG"
+        (n >> 24) as u8,
+        (n >> 16) as u8,
+        (n >> 8) as u8,
+        n as u8,
+        0x01,
+    ];
+    device.write_extended_data(&mut hdr).await?;
+    // Payload rides in packet-size chunks (1024 on the protocol-v3 devices
+    // this plugin drives), 0x00 report id in front of each.
+    for chunk in jpeg.chunks(1024) {
+        let mut buf = Vec::with_capacity(1025);
+        buf.push(0x00);
+        buf.extend_from_slice(chunk);
+        buf.resize(1025, 0);
+        device.write_data(&buf).await?;
+    }
+    let mut stp = vec![0x00, 0x43, 0x52, 0x54, 0x00, 0x00, 0x53, 0x54, 0x50];
+    device.write_extended_data(&mut stp).await
+}
+
+/// A plain black face, flashed when the background is removed so the strip
+/// (and boot screen) go dark instead of showing a stale wallpaper.
+pub fn black_face_jpeg() -> Vec<u8> {
+    let img = image::RgbImage::new(800, 480);
+    let mut buf = Vec::new();
+    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 85);
+    enc.encode(img.as_raw(), 800, 480, image::ExtendedColorType::Rgb8)
+        .ok();
+    buf
+}
+
 fn map_position(mut position: u8, is_encoder: bool) -> Result<u8, MirajazzError> {
     if is_encoder {
         position += 10;
@@ -256,6 +302,8 @@ async fn background_task(candidate: &CandidateDevice) -> Result<(), MirajazzErro
     // still background (frame_count 1) and the icons are both unchanged,
     // skip the tick entirely instead of spamming identical images over USB.
     let mut painted: Option<(usize, u64, usize)> = None;
+    // Background identity whose face was last handled (flashed or skipped).
+    let mut faced: Option<usize> = None;
 
     loop {
         let Some(bg) = background::current().await else {
@@ -266,7 +314,45 @@ async fn background_task(candidate: &CandidateDevice) -> Result<(), MirajazzErro
         if frame >= bg.frame_count() {
             frame = 0; // background was swapped for a shorter one
         }
-        let state = (frame, background::icon_generation(), std::sync::Arc::as_ptr(&bg) as usize);
+        let bg_id = std::sync::Arc::as_ptr(&bg) as usize;
+
+        // New background with a face: flash it (skipped when the marker says
+        // identical content is already on the device), then let OpenDeck
+        // resend icons — the flash write eats anything sent during it.
+        if bg.face_jpeg.is_some() && faced != Some(bg_id) {
+            faced = Some(bg_id);
+            if let Some(jpeg) = &bg.face_jpeg {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                std::hash::Hasher::write(&mut hasher, jpeg);
+                let hash = format!("{:016x}", std::hash::Hasher::finish(&hasher));
+                let marker = background::face_marker_path();
+                let logged = marker
+                    .as_ref()
+                    .and_then(|p| std::fs::read_to_string(p).ok())
+                    .unwrap_or_default();
+                if logged.trim() != hash {
+                    log::info!("background: flashing face ({} bytes) to {}", jpeg.len(), candidate.id);
+                    {
+                        let devices_lock = DEVICES.read().await;
+                        let Some(device) = devices_lock.get(&candidate.id) else {
+                            return Ok(());
+                        };
+                        if let Err(e) = write_face(device, jpeg).await {
+                            log::warn!("background: face flash failed: {e}");
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(2500)).await;
+                    if let Some(p) = marker {
+                        std::fs::write(p, &hash).ok();
+                    }
+                    if let Some(outbound) = OUTBOUND_EVENT_MANAGER.lock().await.as_mut() {
+                        outbound.rerender_images(candidate.id.clone()).await.ok();
+                    }
+                }
+            }
+        }
+
+        let state = (frame, background::icon_generation(), bg_id);
         if painted == Some(state) {
             continue;
         }

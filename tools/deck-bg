@@ -3,7 +3,9 @@
 # driver fork.
 #
 #   deck-bg set <file> [render options]   use a video, GIF, or still image
-#   deck-bg follow                        follow the KDE live wallpaper (Plasma)
+#   deck-bg follow [--monitor <name|idx>] follow one monitor's KDE live
+#                                         wallpaper (Plasma; default: primary)
+#   deck-bg test [render options]         deploy a labelled diagnostic pattern
 #   deck-bg off                           background off, plain icons restored
 #   deck-bg status                        what's active
 #   deck-bg daemon                        (internal) wallpaper-follow loop,
@@ -14,12 +16,15 @@
 # source+options in ~/.cache/deck-bg/renders/. meta.json is always deployed
 # LAST so the driver never loads a half-written background.
 # Requires: python3 + Pillow; ffmpeg for video/GIF sources.
-import hashlib, json, shutil, subprocess, sys, time
+import hashlib, json, re, shutil, subprocess, sys, time
 from pathlib import Path
+from urllib.parse import unquote
 
 CONFIG = Path.home() / '.config/opendeck-akp05/deck-bg.json'
 LIVE = Path.home() / '.config/opendeck-akp05/background'
 CACHE = Path.home() / '.cache/deck-bg'
+APPLETSRC = Path.home() / '.config/plasma-org.kde.plasma.desktop-appletsrc'
+RENDER = Path(__file__).resolve().parent / 'render_frames.py'
 VIDEO_EXT = {'.mp4', '.webm', '.mov', '.mkv', '.avi', '.gif'}
 STILL_EXT = {'.png', '.jpg', '.jpeg', '.bmp', '.webp'}
 POLL_S = 15
@@ -37,21 +42,9 @@ def write_config(cfg):
     CONFIG.write_text(json.dumps(cfg, indent=2))
 
 
-def deploy(source, render_args):
-    """Render (cached) and copy into the live dir, meta.json last."""
-    if '--seconds' not in render_args:
-        # Cap the loop length: the driver keeps every frame decoded in RAM
-        # (a full-length video means hundreds of MB), and long loops read as
-        # wallpaper anyway. Pass your own --seconds to override.
-        render_args = render_args + ['--seconds', '20']
-    key = hashlib.sha1(json.dumps([str(source)] + render_args).encode()).hexdigest()[:12]
-    render = CACHE / 'renders' / key
-    fresh = not (render / 'meta.json').exists()
-    if fresh:
-        subprocess.run(
-            [sys.executable, str(Path(__file__).resolve().parent / 'render_frames.py'),
-             str(source), '--out', str(render)] + render_args,
-            check=True)
+def publish(render):
+    """Copy a rendered frame dir into the live dir, meta.json LAST so the
+    driver never loads a half-written background, and prune stale tiles."""
     LIVE.mkdir(parents=True, exist_ok=True)
     tiles = sorted(render.glob('f*.jpg'))
     for f in tiles:
@@ -61,6 +54,26 @@ def deploy(source, render_args):
     for f in LIVE.glob('f*.jpg'):
         if f.name not in keep:
             f.unlink()
+
+
+def deploy(source, render_args):
+    """Render (cached) and publish into the live dir."""
+    if '--seconds' not in render_args:
+        # Cap the loop length: the driver keeps every frame decoded in RAM
+        # (a full-length video means hundreds of MB), and long loops read as
+        # wallpaper anyway. Pass your own --seconds to override.
+        render_args = render_args + ['--seconds', '20']
+    # 'v3' = renderer format/defaults version (face + zone tiles, 10 fps);
+    # bump it whenever renderer output or defaults change, so stale cached
+    # renders aren't deployed
+    key = hashlib.sha1(json.dumps(['v3', str(source)] + render_args).encode()).hexdigest()[:12]
+    render = CACHE / 'renders' / key
+    fresh = not (render / 'meta.json').exists()
+    if fresh:
+        subprocess.run(
+            [sys.executable, str(RENDER), str(source), '--out', str(render)] + render_args,
+            check=True)
+    publish(render)
     print(f'deck-bg: {Path(source).name} ({"rendered" if fresh else "from cache"})',
           flush=True)
 
@@ -92,25 +105,103 @@ def deployed_source():
         return None
 
 
+def kscreen_outputs():
+    """[{name, priority, enabled}, ...] from kscreen-doctor, or [] if it's
+    unavailable (non-KDE / X11 without the tool)."""
+    try:
+        out = subprocess.run(['kscreen-doctor', '-j'], capture_output=True,
+                             text=True, check=True).stdout
+        return json.loads(out).get('outputs', [])
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        return []
+
+
+def resolve_screen(monitor):
+    """Map a --monitor value to a Plasma QScreen index (its `lastScreen`).
+    None/'' -> primary; a digit -> that index verbatim; a connector name
+    (e.g. DP-1) -> kscreen priority - 1 (priority is 1-based, primary = 1)."""
+    if monitor is None or monitor == '':
+        for o in kscreen_outputs():
+            if o.get('priority') == 1:
+                return o['priority'] - 1
+        return 0
+    if str(monitor).isdigit():
+        return int(monitor)
+    for o in kscreen_outputs():
+        if o.get('name', '').lower() == str(monitor).lower():
+            return o.get('priority', 1) - 1
+    sys.exit(f'deck-bg: no monitor named {monitor!r} '
+             f'(known: {", ".join(o.get("name", "?") for o in kscreen_outputs()) or "none"})')
+
+
+def screen_videos():
+    """{screen_index: Path} — the video wallpaper configured per monitor,
+    read from Plasma's appletsrc (a containment's `lastScreen` tied to its
+    `LastVideo`). This is what lets `follow` pick ONE monitor's wallpaper
+    instead of guessing between all the videos plasmashell has open."""
+    sections, cur = {}, None
+    try:
+        for line in APPLETSRC.read_text().splitlines():
+            line = line.strip()
+            if line.startswith('[') and line.endswith(']'):
+                cur = sections.setdefault(line, {})
+            elif '=' in line and cur is not None:
+                k, v = line.split('=', 1)
+                cur[k] = v
+    except OSError:
+        return {}
+    cont_screen = {}
+    for sec, kv in sections.items():
+        m = re.fullmatch(r'\[Containments\]\[(\d+)\]', sec)
+        if m and 'lastScreen' in kv:
+            cont_screen[m.group(1)] = int(kv['lastScreen'])
+    result = {}
+    for sec, kv in sections.items():
+        if 'LastVideo' not in kv:
+            continue
+        m = re.match(r'\[Containments\]\[(\d+)\]', sec)
+        if not m or m.group(1) not in cont_screen:
+            continue
+        url = kv['LastVideo']
+        path = unquote(url[len('file://'):] if url.startswith('file://') else url)
+        result[cont_screen[m.group(1)]] = Path(path)
+    return result
+
+
+def follow_target(cfg):
+    """The video the followed monitor should show right now, or None.
+    Pins to one monitor so a multi-monitor desktop stops flip-flopping:
+    videos that belong to OTHER monitors (per Plasma's config) are excluded,
+    and the pinned monitor's own `LastVideo` wins when it's live. Falls back
+    to the first remaining live video (covers a rotating playlist on the
+    pinned monitor) and then to the config path if nothing is open."""
+    live = open_wallpaper_videos()
+    vids = screen_videos()
+    screen = resolve_screen(cfg.get('monitor'))
+    own = vids.get(screen)
+    others = {v.name for s, v in vids.items() if s != screen}
+    cands = [v for v in live if v.name not in others]
+    if own:
+        match = next((v for v in live if v.name == own.name), None)
+        if match:
+            return match
+    if cands:
+        return sorted(cands)[0]
+    if own and own.exists():
+        return own
+    return None
+
+
 def daemon():
-    prev_open = set()
     pending = None
     while True:
         cfg = read_config()
         if cfg.get('mode') != 'wallpaper':
-            prev_open = set()
             pending = None
             time.sleep(POLL_S)
             continue
-        now = open_wallpaper_videos()
-        new = now - prev_open
-        prev_open = now
         shown = deployed_source()
-        if new:
-            target = sorted(new)[0]  # what the user just switched to
-        else:
-            target = next((v for v in sorted(now) if v.name == shown), None) \
-                or (sorted(now)[0] if now else None)
+        target = follow_target(cfg)
         if target and target.name != shown:
             if target == pending:    # stable for two polls -> commit
                 deploy(target, cfg.get('render_args', []))
@@ -136,15 +227,37 @@ def main():
         write_config({'mode': 'video', 'source': str(source), 'render_args': render_args})
         deploy(source, render_args)
     elif cmd == 'follow':
+        args = sys.argv[2:]
+        monitor = None
+        if '--monitor' in args:
+            i = args.index('--monitor')
+            if i + 1 >= len(args):
+                sys.exit('usage: deck-bg follow [--monitor <name|index>]')
+            monitor = args[i + 1]
         cfg = read_config()
         cfg['mode'] = 'wallpaper'
+        cfg['monitor'] = monitor  # None => primary monitor
         write_config(cfg)
-        print('deck-bg: following the desktop live wallpaper')
+        screen = resolve_screen(monitor)
+        own = screen_videos().get(screen)
+        where = f'monitor {monitor}' if monitor is not None else 'the primary monitor'
+        print(f'deck-bg: following the live wallpaper on {where} (Plasma screen {screen})')
+        if own:
+            print(f'  current wallpaper there: {own.name}')
         r = subprocess.run(['systemctl', '--user', 'is-active', '--quiet',
                             'deck-bg-sync.service'])
         if r.returncode != 0:
             print('note: the follow daemon is not running — enable it with:\n'
                   '  systemctl --user enable --now deck-bg-sync.service')
+    elif cmd == 'test':
+        render = CACHE / 'renders' / '__test__'
+        subprocess.run(
+            [sys.executable, str(RENDER), '--test', '--out', str(render)] + sys.argv[2:],
+            check=True)
+        publish(render)
+        print('deck-bg: test pattern deployed — the strip should read a smooth\n'
+              '  left→right colour ramp with "S0 S1 S2 S3 >>" upright and in order.\n'
+              '  Run `deck-bg set <file>` or `deck-bg off` to restore.')
     elif cmd == 'off':
         cfg = read_config()
         cfg['mode'] = 'off'
@@ -157,6 +270,9 @@ def main():
         if cfg.get('mode') == 'video':
             print(f"source: {cfg.get('source')}")
         if cfg.get('mode') == 'wallpaper':
+            monitor = cfg.get('monitor')
+            print(f"following: {monitor if monitor is not None else 'primary monitor'} "
+                  f"(Plasma screen {resolve_screen(monitor)})")
             r = subprocess.run(['systemctl', '--user', 'is-active', '--quiet',
                                 'deck-bg-sync.service'])
             print(f"follow daemon: {'running' if r.returncode == 0 else 'NOT running'}")
@@ -170,7 +286,7 @@ def main():
         daemon()
     else:
         sys.exit('usage: deck-bg set <video|gif|image> [render options] '
-                 '| follow | off | status')
+                 '| follow [--monitor <name|index>] | test | off | status')
 
 
 if __name__ == '__main__':

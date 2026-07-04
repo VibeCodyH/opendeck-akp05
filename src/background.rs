@@ -46,6 +46,8 @@ struct Meta {
     #[serde(default)]
     strip: usize, // number of strip tiles per frame (0 = no strip band)
     #[serde(default)]
+    face: Option<String>, // full-face background JPEG (f_face.jpg), pre-rotated 180
+    #[serde(default)]
     source: Option<String>,
     #[serde(default = "default_key_lo")]
     key_lo: u8,
@@ -58,6 +60,11 @@ struct Meta {
 pub struct Background {
     // frame -> slot -> tile; slots: 0-9 = keys (row*COL_COUNT+col), STRIP_SLOT+i = strip
     frames: Vec<HashMap<u8, RgbImage>>,
+    // When present (meta.face), flashed once per background change as the
+    // device's persistent full-face background: it lights the ~32px gaps
+    // between the strip's four zone windows — the zones themselves animate
+    // via normal per-key writes cropped in register with it.
+    pub face_jpeg: Option<Vec<u8>>,
     strip: usize,
     pub interval_ms: u64,
     key_lo: u8,
@@ -92,6 +99,14 @@ fn meta_path() -> Option<std::path::PathBuf> {
     )
 }
 
+/// Marker recording the hash of the face last flashed to the device, so a
+/// driver restart doesn't rewrite identical content (the face write is a
+/// firmware flash write — spare the cycles). One file even with several
+/// decks attached: same background goes to all of them.
+pub fn face_marker_path() -> Option<std::path::PathBuf> {
+    Some(meta_path()?.parent()?.join(".face-logged"))
+}
+
 /// Polls meta.json and (re)loads the background when it appears or changes.
 pub async fn watch_task(token: CancellationToken) {
     let mut last: Option<SystemTime> = None;
@@ -107,6 +122,19 @@ pub async fn watch_task(token: CancellationToken) {
             let now = bg.is_some();
             *BACKGROUND.write().await = bg.map(Arc::new);
             if was && !now {
+                // If a face was flashed, flash black over it FIRST (the flash
+                // write drops commands sent during it, so it must precede the
+                // clears) — otherwise the strip keeps the stale wallpaper.
+                if let Some(marker) = face_marker_path() {
+                    if marker.exists() {
+                        let black = crate::device::black_face_jpeg();
+                        for (_, device) in crate::DEVICES.read().await.iter() {
+                            crate::device::write_face(device, &black).await.ok();
+                        }
+                        tokio::time::sleep(Duration::from_millis(2500)).await;
+                        std::fs::remove_file(marker).ok();
+                    }
+                }
                 // Background removed: wipe the stale video off every surface
                 // BEFORE the rerender below restores the plain icons.
                 for (_, device) in crate::DEVICES.read().await.iter() {
@@ -163,6 +191,21 @@ fn load() -> Option<Background> {
     let rows = meta.rows.min(ROW_COUNT);
     let cols = meta.cols.min(COL_COUNT);
     let strip = meta.strip.min(4);
+
+    // Persistent full-face background (fills the strip's inter-zone gaps)
+    let mut face_jpeg = None;
+    if strip > 0 {
+        if let Some(name) = &meta.face {
+            match std::fs::read(dir.join(name)) {
+                Ok(bytes) => face_jpeg = Some(bytes),
+                Err(e) => {
+                    log::warn!("background: failed to read face {name}: {e}");
+                    return None;
+                }
+            }
+        }
+    }
+
     let mut frames = Vec::with_capacity(meta.count);
     for i in 0..meta.count {
         let mut tiles = HashMap::new();
@@ -184,16 +227,18 @@ fn load() -> Option<Background> {
 
     let fps = if meta.fps > 0.0 { meta.fps } else { 5.0 };
     log::info!(
-        "background: loaded {} frames ({}x{} keys, {} strip tiles @ {} fps, source={})",
+        "background: loaded {} frames ({}x{} keys, {} strip tiles{} @ {} fps, source={})",
         frames.len(),
         rows,
         cols,
         strip,
+        if face_jpeg.is_some() { " + face" } else { "" },
         fps,
         meta.source.as_deref().unwrap_or("?")
     );
     Some(Background {
         frames,
+        face_jpeg,
         strip,
         interval_ms: (1000.0 / fps) as u64,
         key_lo: meta.key_lo,
